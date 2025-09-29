@@ -1,0 +1,45 @@
+{
+  "name": "codex-execution-service",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write './src/**/*.{ts,tsx,js,json,md}'",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format cjs",
+    "start:listener": "tsx src/workers/submitCodeExecListenerWorker.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dockerode": "^4.0.8",
+    "dotenv": "^17.2.1",
+    "inversify": "^7.7.0",
+    "ioredis": "^5.7.0",
+    "kafkajs": "^2.2.4",
+    "prom-client": "^15.1.3",
+    "tar-stream": "^3.1.7",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@types/dockerode": "^3.3.44",
+    "@types/dotenv": "^6.1.1",
+    "@types/node": "^24.1.0",
+    "@types/tar-stream": "^3.1.4",
+    "@typescript-eslint/eslint-plugin": "^8.38.0",
+    "@typescript-eslint/parser": "^8.38.0",
+    "eslint": "^9.31.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import-helpers": "^2.0.1",
+    "eslint-plugin-prettier": "^5.5.3",
+    "eslint-plugin-unused-imports": "^4.1.4",
+    "prettier": "^3.6.2",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
