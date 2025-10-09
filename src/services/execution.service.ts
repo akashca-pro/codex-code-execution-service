@@ -55,14 +55,15 @@ export class ExecutionService implements IExecutionService {
                     const executionResult = await this.judge({
                         code : data.executableCode,
                         language : data.language,
-                        testCases : data.testCases
+                        testCases : data.testCases,
+                        mode : 'submit'
                     });
                     const jobPayload : ISubmissionResult = {
                         submissionId : data.submissionId,
                         userId : data.userId,
                         executionResult : executionResult,
                     }
-                    console.log(jobPayload);
+                    console.log(executionResult)
                     await this.#_kafkaManager.sendMessage(
                         KafkaTopics.SUBMISSION_RESULTS,
                         jobPayload.submissionId,
@@ -96,6 +97,7 @@ export class ExecutionService implements IExecutionService {
                         code : data.executableCode,
                         language : data.language,
                         testCases : data.testCases,
+                        mode : 'run'
                     });
                     const jobPayload : IRunCodeResult = {
                         tempId : data.tempId,
@@ -132,7 +134,7 @@ export class ExecutionService implements IExecutionService {
                     }
                     const result = await this.#_runner.runCode(
                         data.language,
-                        data.userCode,
+                        JSON.parse(data.userCode),
                         true
                     );
                     const jobPayload : ICustomCodeResult = {
@@ -163,7 +165,7 @@ export class ExecutionService implements IExecutionService {
         try {
 
             // 1. Execute the generated code once
-            const result = await this.#_runner.runCode(
+            const result =  await this.#_runner.runCode(
                 props.language,
                 props.code,
             );
@@ -175,6 +177,8 @@ export class ExecutionService implements IExecutionService {
                         totalTestCase: totalTestCases,
                         passedTestCase: 0,
                         failedTestCase: totalTestCases,
+                        executionTimeMs : 0,
+                        memoryMB : 0
                     },
                     failedTestCase: {
                         index: 0,
@@ -191,41 +195,85 @@ export class ExecutionService implements IExecutionService {
             let executionTimeMs = 0 
             let memoryMB = 0; 
 
+            const allResults: ExecutionResult["testResults"] = [];
+
             for (const line of outputLines) {
                 try {
                     const testResult = JSON.parse(line);
                     executionTimeMs = Math.max(executionTimeMs, parseFloat(testResult.executionTimeMs));
                     memoryMB = Math.max(memoryMB, parseFloat(testResult.memoryMB));
-                    if (testResult.status === "passed") {
+
+                    const testCase = props.testCases[testResult.index];
+                    const passed = testResult.status === "passed";
+
+                    if(props.mode === 'run'){
+                        allResults.push({
+                            Id: testCase.Id,
+                            index: testResult.index,
+                            input: testCase.input,
+                            output: testResult.actual ? JSON.stringify(testResult.actual) : testCase.output, // backend must send `actual` here
+                            expectedOutput: testCase.output,
+                            passed,
+                            executionTimeMs: parseFloat(testResult.executionTimeMs),
+                            memoryMB: parseFloat(testResult.memoryMB),
+                        });
+                    }
+
+                    if (passed) {
                         passedTestCases++;
-                    } else {
-                        // A test case failed, stop and report it
-                        const failedTC = props.testCases[testResult.index];
-                            return {
-                                stats: {
-                                    totalTestCase: totalTestCases,
-                                    passedTestCase: passedTestCases,
-                                    failedTestCase: totalTestCases - passedTestCases,
-                                    executionTimeMs,
-                                    memoryMB,
-                                    stdout : result.stderr ? result.stderr : undefined
-                                },
-                                failedTestCase: {
-                                    index: testResult.index,
-                                    input: failedTC.input,
-                                    output: testResult.actual,
-                                    expectedOutput: testResult.expected,
-                                },
-                            };
+                    } else if (props.mode === 'submit') {
+                        // stop immediately on first failure
+                        return {
+                            stats: {
+                                totalTestCase: totalTestCases,
+                                passedTestCase: passedTestCases,
+                                failedTestCase: totalTestCases - passedTestCases,
+                                executionTimeMs,
+                                memoryMB,
+                                stdout: result.stderr ?? undefined,
+                            },
+                            failedTestCase: {
+                                index: testResult.index,
+                                input: testCase.input,
+                                output: testResult.actual ? JSON.stringify(testResult.actual) : testCase.output,
+                                expectedOutput: testCase.output,
+                            },
+                        };
                     }
                 } catch (e) {
                     // Handle cases where stdout is not valid JSON
                     return {
-                        stats: { totalTestCase: totalTestCases, passedTestCase: 0, failedTestCase: totalTestCases, executionTimeMs, memoryMB },
-                        failedTestCase: { index: 0, input: "", output: `Invalid judge output: ${line}`, expectedOutput: "" },
+                        stats: {
+                            totalTestCase : totalTestCases,
+                            passedTestCase: 0,
+                            failedTestCase: totalTestCases,
+                            executionTimeMs,
+                            memoryMB,
+                        },
+                        failedTestCase: {
+                            index: 0,
+                            input: "",
+                            output: `Invalid judge output: ${line}`,
+                            expectedOutput: "",
+                        },
                     };
                 }
             }
+
+                if (props.mode === "run") {
+                return {
+                    stats: {
+                        totalTestCase : totalTestCases,
+                        passedTestCase : passedTestCases,
+                        failedTestCase: totalTestCases - passedTestCases,
+                        executionTimeMs,
+                        memoryMB,
+                        stdout: result.stdout ?? undefined,
+                    },
+                    testResults: allResults,
+                };
+                }
+
 
             // 5. All test cases passed
             return {
@@ -235,7 +283,7 @@ export class ExecutionService implements IExecutionService {
                     failedTestCase: 0,
                     executionTimeMs,
                     memoryMB,
-                    stdout : result.stdout ? result.stdout : undefined
+                    stdout : result.stdout ?? undefined
                 },
             };
 
@@ -243,4 +291,5 @@ export class ExecutionService implements IExecutionService {
             throw new Error(`Internal error while executing code, ${error}`);
         }
     }
+
 }

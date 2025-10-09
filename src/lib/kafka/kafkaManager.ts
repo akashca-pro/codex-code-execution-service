@@ -20,7 +20,7 @@ export class KafkaManager {
 
   private constructor() {
     this.kafka = new Kafka({
-      clientId: config.KAFKA_CLIENT_ID,
+      clientId: config.KAFKA_CODE_EXECUTION_SERVICE_CLIENT_ID,
       brokers: config.KAFKA_BROKERS.split(','),
       logLevel: logLevel.INFO,
     });
@@ -233,7 +233,7 @@ export class KafkaManager {
   public async reloadConfig(newBrokers: string[]) {
     logger.info('Reloading Kafka brokers...');
     await this.disconnect();
-    this.kafka = new Kafka({ clientId: config.KAFKA_CLIENT_ID, brokers: newBrokers, logLevel: logLevel.INFO });
+    this.kafka = new Kafka({ clientId: config.KAFKA_CODE_EXECUTION_SERVICE_CLIENT_ID, brokers: newBrokers, logLevel: logLevel.INFO });
     await this.init();
   }
 

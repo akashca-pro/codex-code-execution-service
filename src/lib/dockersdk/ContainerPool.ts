@@ -1,10 +1,13 @@
 import Docker, { Container, ContainerCreateOptions } from "dockerode";
+import fs from "fs";
 import tar from "tar-stream";
 import { PassThrough } from "stream";
 import { config } from "@/config";
 import { Language } from "@/enums/Language.enum";
 
-export const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+export const docker = fs.existsSync(config.DOCKER_LOCAL)
+  ? new Docker({ socketPath: config.DOCKER_LOCAL }) // Local dev
+  : new Docker({ host: config.DOCKER_HOST, port : config.DOCKER_PORT }); // K8s DinD
 
 interface ExecResult {
   success: boolean;
@@ -15,7 +18,6 @@ interface ExecResult {
 }
 
 const MAX_OUTPUT_LENGTH = config.MAX_OUTPUT_LENGTH
-
 
 export class ContainerPool {
   #_image: string;

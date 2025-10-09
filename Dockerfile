@@ -1,0 +1,34 @@
+#stage 1: build
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+RUN npm install -g npm@latest
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+RUN npm run build
+
+#stage 2 runtime
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+RUN apk add --no-cache netcat-openbsd docker-cli
+
+COPY start.sh .
+
+RUN chmod +x ./start.sh
+
+COPY --from=builder /app/dist /app/src
+
+COPY --from=builder /app/node_modules /app/node_modules
+
+EXPOSE 9102 50052
+
+CMD ["./start.sh"]

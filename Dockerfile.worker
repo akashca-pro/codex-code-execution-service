@@ -1,0 +1,53 @@
+# Stage 1: Builder stage (only for Go standard lib precompilation)
+FROM golang:1.20-alpine AS gobuilder
+
+ENV GOCACHE=/go-cache
+WORKDIR /go-build
+
+# Pre-warm the cache by compiling std and common packages
+RUN go install std
+
+# Stage 2: Final minimal runtime image
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    python3 \
+    go \
+    bash \
+    tini
+
+# Create a non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Create temp directory for user code execution
+RUN mkdir -p /sandbox/code /sandbox/bin /sandbox/results && \
+    chown -R appuser:appgroup /sandbox
+
+# Remove unnecessary write permissions from system dirs
+RUN chmod 555 /bin /usr/bin /usr/local/bin
+
+# Create cache directory for Go
+RUN mkdir -p /go-cache && chown -R appuser:appgroup /go-cache
+
+# Copy prebuilt cache
+COPY --from=gobuilder --chown=appuser:appgroup /go-cache /go-cache
+
+WORKDIR /app
+
+# Switch to non-root user
+USER appuser
+
+# Pre-build Go standard library to optimize performance
+RUN go build -v -o /dev/null std
+
+ENV GOCACHE=/go-cache
+ENV GOPATH=/go
+
+# Use tini as entrypoint
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Default command → keep container alive
+CMD ["tail", "-f", "/dev/null"]
