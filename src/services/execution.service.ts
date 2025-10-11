@@ -10,13 +10,12 @@ import { ICacheProvider } from "@/providers/ICacheProvider.interface";
 import { config } from "@/config";
 import { Runner } from "@/lib/dockersdk/ContainerPool";
 import { ExecutionResult, IJudgeProps } from "@/types/judge.types";
-import logger from "@/utils/logger";
+import logger from "@/utils/pinoLogger";
 
 
 /**
  * Class responsible executing code and publish to kafka.
- * 
- * @class
+ * * @class
  * @implements {IExecutionService}
  */
 @injectable()
@@ -42,40 +41,59 @@ export class ExecutionService implements IExecutionService {
     }
 
     async submitCodeExec(): Promise<void> {
+        const topic = KafkaTopics.SUBMISSION_JOBS;
+        const group = KafkaConsumerGroups.CE_SUB_NORMAL_EXEC;
+        logger.info(`[CONSUMER_SERVICE] Setting up consumer for topic: ${topic} with group: ${group}`);
+
         await this.#_kafkaManager.createConsumer(
-            KafkaConsumerGroups.CE_SUB_NORMAL_EXEC,
-            KafkaTopics.SUBMISSION_JOBS,
+            group,
+            topic,
             async (data : ISubmissionExecJobPayload) => {
-                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_SUBMIT_RESULT}:${data.submissionId}`;
+                const method = 'submitCodeExec (Job)';
+                const submissionId = data.submissionId;
+                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_SUBMIT_RESULT}:${submissionId}`;
+                logger.info(`[CONSUMER_SERVICE] ${method}: Received job`, { submissionId, language: data.language, userId: data.userId });
+
                 try {
+                    // Idempotency Check
                     const alreadyProcessed = await this.#_cacheProvider.get(idempotencyKey);
                     if(alreadyProcessed){
+                        logger.warn(`[CONSUMER_SERVICE] ${method}: Idempotency key found. Skipping execution.`, { submissionId });
                         return;
                     }
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency check passed. Starting judge process.`, { submissionId });
+                    
                     const executionResult = await this.judge({
                         code : data.executableCode,
                         language : data.language,
                         testCases : data.testCases,
                         mode : 'submit'
                     });
+                    
                     const jobPayload : ISubmissionResult = {
-                        submissionId : data.submissionId,
+                        submissionId : submissionId,
                         userId : data.userId,
                         executionResult : executionResult,
                     }
-                    console.log(executionResult)
+                    
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Judge complete. Status: ${executionResult.stats?.passedTestCase === executionResult.stats?.totalTestCase ? 'AC' : 'WA/ERR'}`);
+
                     await this.#_kafkaManager.sendMessage(
                         KafkaTopics.SUBMISSION_RESULTS,
                         jobPayload.submissionId,
                         jobPayload
                     );
+                    logger.info(`[CONSUMER_SERVICE] ${method}: Result published to ${KafkaTopics.SUBMISSION_RESULTS}.`, { submissionId });
+
                     await this.#_cacheProvider.set(
                         idempotencyKey,
                         '1', 
                         config.KAFKA_IDEMPOTENCY_KEY_EXPIRY
                     ); 
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency key set.`, { submissionId });
+
                 } catch (error) {
-                    logger.error('Error processing submission job from Kafka:', error);
+                    logger.error(`[CONSUMER_SERVICE] ${method}: Error processing submission job. Throwing to trigger retry logic.`, { submissionId, error });
                     throw error;
                 }
             }
@@ -83,38 +101,58 @@ export class ExecutionService implements IExecutionService {
     }
 
     async runCodeExec(): Promise<void> {
+        const topic = KafkaTopics.RUN_JOBS;
+        const group = KafkaConsumerGroups.CE_RUN_NORMAL_EXEC;
+        logger.info(`[CONSUMER_SERVICE] Setting up consumer for topic: ${topic} with group: ${group}`);
+
         await this.#_kafkaManager.createConsumer(
-            KafkaConsumerGroups.CE_RUN_NORMAL_EXEC,
-            KafkaTopics.RUN_JOBS,
+            group,
+            topic,
             async (data : IRunCodeExecJobPayload) => {
-                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_RUN_RESULT}:${data.tempId}`;
+                const method = 'runCodeExec (Job)';
+                const tempId = data.tempId;
+                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_RUN_RESULT}:${tempId}`;
+                logger.info(`[CONSUMER_SERVICE] ${method}: Received job`, { tempId, language: data.language });
+
                 try {
+                    // Idempotency Check
                     const alreadyProcessed = await this.#_cacheProvider.get(idempotencyKey);
                     if(alreadyProcessed){
+                        logger.warn(`[CONSUMER_SERVICE] ${method}: Idempotency key found. Skipping execution.`, { tempId });
                         return;
                     }
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency check passed. Starting judge process.`, { tempId });
+
                     const executionResult = await this.judge({
                         code : data.executableCode,
                         language : data.language,
                         testCases : data.testCases,
                         mode : 'run'
                     });
+                    
                     const jobPayload : IRunCodeResult = {
-                        tempId : data.tempId,
+                        tempId : tempId,
                         executionResult : executionResult                     
                     }
+
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Judge complete. Status: ${executionResult.stats?.passedTestCase === executionResult.stats?.totalTestCase ? 'AC' : 'WA/ERR'}`);
+
                     await this.#_kafkaManager.sendMessage(
                         KafkaTopics.RUN_RESULTS,
                         jobPayload.tempId,
                         jobPayload
                     )
+                    logger.info(`[CONSUMER_SERVICE] ${method}: Result published to ${KafkaTopics.RUN_RESULTS}.`, { tempId });
+
                     await this.#_cacheProvider.set(
                         idempotencyKey,
                         '1', 
                         config.KAFKA_IDEMPOTENCY_KEY_EXPIRY
                     );
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency key set.`, { tempId });
+
                 } catch (error) {
-                    logger.error('Error processing submission job from Kafka:', error);
+                    logger.error(`[CONSUMER_SERVICE] ${method}: Error processing run job. Throwing to trigger retry logic.`, { tempId, error });
                     throw error;
                 }
             }
@@ -122,37 +160,57 @@ export class ExecutionService implements IExecutionService {
     }
 
     async customCodeExec(): Promise<void> {
+        const topic = KafkaTopics.CUSTOM_JOBS;
+        const group = KafkaConsumerGroups.CE_CUSTOM_NORMAL_EXEC;
+        logger.info(`[CONSUMER_SERVICE] Setting up consumer for topic: ${topic} with group: ${group}`);
+
         await this.#_kafkaManager.createConsumer(
-            KafkaConsumerGroups.CE_CUSTOM_NORMAL_EXEC,
-            KafkaTopics.CUSTOM_JOBS,
+            group,
+            topic,
             async (data : ICustomCodeExecJobPayload) => {
-                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_CUSTOM_RESULT}:${data.tempId}`;
+                const method = 'customCodeExec (Job)';
+                const tempId = data.tempId;
+                const idempotencyKey = `${REDIS_PREFIX.KAFKA_IDEMPOTENCY_KEY_CUSTOM_RESULT}:${tempId}`;
+                logger.info(`[CONSUMER_SERVICE] ${method}: Received job`, { tempId, language: data.language });
+
                 try {
+                    // Idempotency Check
                     const alreadyProcessed = await this.#_cacheProvider.get(idempotencyKey);
                     if(alreadyProcessed){
+                        logger.warn(`[CONSUMER_SERVICE] ${method}: Idempotency key found. Skipping execution.`, { tempId });
                         return;
                     }
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency check passed. Starting custom code execution.`, { tempId });
+
+                    const codeToRun = JSON.parse(data.userCode);
                     const result = await this.#_runner.runCode(
                         data.language,
-                        JSON.parse(data.userCode),
-                        true
+                        codeToRun,
+                        true // isCustom
                     );
+                    
                     const jobPayload : ICustomCodeResult = {
-                        tempId : data.tempId,
+                        tempId : tempId,
                         stdOut : result.success ? result.stdout! : result.stderr!
                     }
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Execution complete. Success: ${result.success}`);
+
                     await this.#_kafkaManager.sendMessage(
                         KafkaTopics.CUSTOM_RESULTS,
                         data.tempId,
                         jobPayload
                     );
+                    logger.info(`[CONSUMER_SERVICE] ${method}: Result published to ${KafkaTopics.CUSTOM_RESULTS}.`, { tempId });
+
                     await this.#_cacheProvider.set(
                         idempotencyKey,
                         '1', 
                         config.KAFKA_IDEMPOTENCY_KEY_EXPIRY
                     );
+                    logger.debug(`[CONSUMER_SERVICE] ${method}: Idempotency key set.`, { tempId });
+
                 } catch (error) {
-                    logger.error('Error processing submission job from Kafka:', error);
+                    logger.error(`[CONSUMER_SERVICE] ${method}: Error processing custom job. Throwing to trigger retry logic.`, { tempId, error });
                     throw error;
                 }
             }
@@ -160,18 +218,28 @@ export class ExecutionService implements IExecutionService {
     }
 
     private async judge(props: IJudgeProps): Promise<ExecutionResult> {
+        const method = 'judge';
         const totalTestCases = props.testCases.length;
+        const mode = props.mode;
+        logger.info(`[JUDGE] ${method} started`, { mode, language: props.language, totalTestCases });
 
         try {
+            const startTime = Date.now();
 
             // 1. Execute the generated code once
+            logger.debug(`[JUDGE] Running code in Docker container...`, { mode, language: props.language });
             const result =  await this.#_runner.runCode(
                 props.language,
                 props.code,
             );
+            const executionDuration = Date.now() - startTime;
+            logger.debug(`[JUDGE] Docker execution finished. Success: ${result.success}, Duration: ${executionDuration}ms`);
+
 
             // 3. Handle compilation or global runtime errors
             if (!result.success) {
+                const errorOutput = result.stderr ?? result.error ?? "Execution Error";
+                logger.warn(`[JUDGE] Code execution failed with error.`, { errorOutput: errorOutput.substring(0, 100) });
                 return {
                     stats: {
                         totalTestCase: totalTestCases,
@@ -183,7 +251,7 @@ export class ExecutionService implements IExecutionService {
                     failedTestCase: {
                         index: 0,
                         input: props.testCases[0].input,
-                        output: result.stderr ?? result.error ?? "Execution Error",
+                        output: errorOutput,
                         expectedOutput: props.testCases[0].output,
                     },
                 };
@@ -197,16 +265,24 @@ export class ExecutionService implements IExecutionService {
 
             const allResults: ExecutionResult["testResults"] = [];
 
+            logger.debug(`[JUDGE] Parsing ${outputLines.length} judge output lines.`);
+
             for (const line of outputLines) {
                 try {
                     const testResult = JSON.parse(line);
+                    
+                    // Update max resources used
                     executionTimeMs = Math.max(executionTimeMs, parseFloat(testResult.executionTimeMs));
                     memoryMB = Math.max(memoryMB, parseFloat(testResult.memoryMB));
 
                     const testCase = props.testCases[testResult.index];
                     const passed = testResult.status === "passed";
 
-                    if(props.mode === 'run'){
+                    if (passed) {
+                        passedTestCases++;
+                    } 
+                    
+                    if(mode === 'run'){
                         allResults.push({
                             Id: testCase.Id,
                             index: testResult.index,
@@ -217,12 +293,9 @@ export class ExecutionService implements IExecutionService {
                             executionTimeMs: parseFloat(testResult.executionTimeMs),
                             memoryMB: parseFloat(testResult.memoryMB),
                         });
-                    }
-
-                    if (passed) {
-                        passedTestCases++;
-                    } else if (props.mode === 'submit') {
-                        // stop immediately on first failure
+                    } else if (mode === 'submit' && !passed) {
+                        // stop immediately on first failure for 'submit' mode
+                        logger.warn(`[JUDGE] Test case ${testResult.index} failed. Aborting submission judge.`, { index: testResult.index });
                         return {
                             stats: {
                                 totalTestCase: totalTestCases,
@@ -242,6 +315,7 @@ export class ExecutionService implements IExecutionService {
                     }
                 } catch (e) {
                     // Handle cases where stdout is not valid JSON
+                    logger.error(`[JUDGE] Invalid judge output received.`, { line, error: e });
                     return {
                         stats: {
                             totalTestCase : totalTestCases,
@@ -260,7 +334,9 @@ export class ExecutionService implements IExecutionService {
                 }
             }
 
-                if (props.mode === "run") {
+            // Return for 'run' mode (all results collected)
+            if (mode === "run") {
+                logger.info(`[JUDGE] Run mode judge completed. Passed: ${passedTestCases}/${totalTestCases}`);
                 return {
                     stats: {
                         totalTestCase : totalTestCases,
@@ -272,10 +348,11 @@ export class ExecutionService implements IExecutionService {
                     },
                     testResults: allResults,
                 };
-                }
+            }
 
 
-            // 5. All test cases passed
+            // 5. All test cases passed for 'submit' mode
+            logger.info(`[JUDGE] Submit mode judge completed. All ${totalTestCases} tests passed.`);
             return {
                 stats: {
                     totalTestCase: totalTestCases,
@@ -288,6 +365,7 @@ export class ExecutionService implements IExecutionService {
             };
 
         } catch (error) {
+            logger.error(`[JUDGE] Critical internal error during code execution.`, { error });
             throw new Error(`Internal error while executing code, ${error}`);
         }
     }
