@@ -1,3 +1,4 @@
+import './config/tracing'
 import logger from '@/utils/pinoLogger';
 import container from '@/config/inversify/container';
 import TYPES from '@/config/inversify/types';
