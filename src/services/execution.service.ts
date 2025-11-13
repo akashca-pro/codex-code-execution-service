@@ -303,7 +303,7 @@ export class ExecutionService implements IExecutionService {
                                 failedTestCase: totalTestCases - passedTestCases,
                                 executionTimeMs,
                                 memoryMB,
-                                stdout: result.stderr ?? undefined,
+                                stdout: result.stderr ? result.stderr : result.stdout ? result.stdout : undefined,
                             },
                             failedTestCase: {
                                 index: testResult.index,
