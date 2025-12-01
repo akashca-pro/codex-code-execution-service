@@ -9,6 +9,7 @@ export interface IJudgeProps {
         input: string;
         output: string;
     }[];
+    mode: "run" | "submit"
 }
 
 interface Stats {
@@ -26,7 +27,20 @@ interface FailedTestCase {
     output: any; // Can be string for error, or array for wrong answer
     expectedOutput: any;
 }
+
+interface TestResult {
+    Id?: string;
+    index : string;
+    input : string;
+    output : any;
+    expectedOutput: string;
+    passed: boolean
+    executionTimeMs: number
+    memoryMB: number
+}
+
 export interface ExecutionResult {
     stats?: Stats | undefined;
     failedTestCase?: FailedTestCase | undefined;
+    testResults? : TestResult[]
 }

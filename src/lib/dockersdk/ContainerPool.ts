@@ -1,10 +1,14 @@
 import Docker, { Container, ContainerCreateOptions } from "dockerode";
+import fs from "fs";
 import tar from "tar-stream";
 import { PassThrough } from "stream";
 import { config } from "@/config";
 import { Language } from "@/enums/Language.enum";
+import logger from "@/utils/pinoLogger";
 
-export const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+export const docker = fs.existsSync(config.DOCKER_LOCAL)
+  ? new Docker({ socketPath: config.DOCKER_LOCAL }) // Local dev
+  : new Docker({ host: config.DOCKER_HOST, port : config.DOCKER_PORT }); // K8s DinD
 
 interface ExecResult {
   success: boolean;
@@ -15,7 +19,6 @@ interface ExecResult {
 }
 
 const MAX_OUTPUT_LENGTH = config.MAX_OUTPUT_LENGTH
-
 
 export class ContainerPool {
   #_image: string;
@@ -53,24 +56,30 @@ export class ContainerPool {
   }
   
   private async _createContainer(): Promise<Container> {
-    console.log("[POOL] Creating new container...");
+    logger.info("[POOL] Creating new container...");
     const container = await docker.createContainer(this.getContainerOptions());
     await container.start();
-    // OPTIONAL BACKUP FIX: Ensure permissions are correct after tmpfs mount (runs as root)
-    // await this._ensurePermissions(container);
-    console.log(`[POOL] New container ${container.id.substring(0, 12)} created and started.`);
+    logger.info(`[POOL] New container ${container.id.substring(0, 12)} created and started.`);
     return container;
   }
 
 async init() {
-    console.log("[POOL] Initializing container pool...");
+    logger.info("[POOL] Initializing container pool...");
     const allContainers = await docker.listContainers({ all: true });
     const existing = allContainers
-      .filter(c => c.Image === this.#_image)
+      .filter(c => c.Image === this.#_image && c.State === 'running')
       .map(c => docker.getContainer(c.Id));
 
     this.pool = [...existing];
-    console.log(`[POOL] Found ${existing.length} existing containers.`);
+    logger.info(`[POOL] Found ${existing.length} existing containers.`);
+
+    // Clean up non-running containers with the same image
+    const stopped = allContainers
+      .filter(c => c.Image === this.#_image && c.State !== 'running');
+    
+    logger.info(`[POOL] Removing ${stopped.length} stopped containers.`);
+    await Promise.all(stopped.map(c => docker.getContainer(c.Id).remove({ force: true }).catch(e => logger.warn(`[POOL] Could not remove stopped container ${c.Id.substring(0,12)}`, e))));
+
 
     const toCreate = this.#_size - this.pool.length;
     for (let i = 0; i < toCreate; i++) {
@@ -78,11 +87,11 @@ async init() {
       this.pool.push(newContainer);
     }
 
-    console.log(`${this.pool.length} containers ready (reused + new).`);
+    logger.info(`${this.pool.length} containers ready (reused + new).`);
   }
 
   startMonitoring(intervalMs = 3000) {
-    console.log(`Starting container monitoring with ${intervalMs}ms interval.`);
+    logger.info(`Starting container monitoring with ${intervalMs}ms interval.`);
     this.monitorInterval = setInterval(async () => {
       for (let i = 0; i < this.pool.length; i++) {
         const container = this.pool[i];
@@ -94,16 +103,40 @@ async init() {
         try {
           const inspect = await container.inspect();
           if (!inspect.State.Running) {
-            console.warn(`Container ${container.id.substring(0, 12)} found dead. Replacing...`);
+            logger.warn(`Container ${container.id.substring(0, 12)} found dead. Replacing...`);
             await this.replaceContainer(i);
           }
         } catch (err) {
             // Container likely doesn't exist anymore
-            console.error(`Health check failed for container index ${i}. Replacing...`);
+            logger.error(`Health check failed for container index ${i}. Replacing...`);
             await this.replaceContainer(i);
         }
       }
     }, intervalMs);
+  }
+
+  /**
+   * Replaces a specific container instance, typically after a critical
+   * failure like a timeout, and removes it from the busy set.
+   * @param container The container instance to replace.
+   */
+  async replace(container: Container) {
+    const containerId = container.id.substring(0, 12);
+    logger.warn(`Replacing bad container ${containerId}...`);
+    
+    const index = this.pool.indexOf(container);
+    
+    this.busy.delete(container);
+    
+    if (index === -1) {
+        logger.error(`Cannot replace container ${containerId}: not found in pool. Attempting removal anyway.`);
+        // force remove.
+        try { await container.remove({ force: true }); } catch (e) {
+            logger.warn(`Failed to remove bad container ${containerId} (not in pool).`, e)
+        }
+        return;
+    }
+    await this.replaceContainer(index);
   }
 
   private async replaceContainer(index: number) {
@@ -115,14 +148,14 @@ async init() {
 
       const newContainer = await this._createContainer();
       this.pool[index] = newContainer;
-      console.log(`Container at index ${index} replaced with ${newContainer.id.substring(0,12)}.`);
+      logger.info(`Container at index ${index} replaced with ${newContainer.id.substring(0,12)}.`);
   }
 
   stopMonitoring() {
     if (this.monitorInterval) {
       clearInterval(this.monitorInterval);
       this.monitorInterval = undefined;
-      console.log("Container monitoring stopped.");
+      logger.info("Container monitoring stopped.");
     }
   }
 
@@ -166,14 +199,14 @@ async init() {
     const cleanupPromises = this.pool.map(c => 
       c.remove({ force: true }).catch(err => {
         // Ignore errors if container is already gone
-        console.warn(`Could not remove container ${c.id.substring(0,12)}: ${err.message}`);
+        logger.warn(`Could not remove container ${c.id.substring(0,12)}: ${err.message}`);
       })
     );
     await Promise.all(cleanupPromises);
     this.pool = [];
     this.busy.clear();
     this.waiters = [];
-    console.log("Container pool cleaned up.");
+    logger.info("Container pool cleaned up.");
   }
 
 }
@@ -198,6 +231,8 @@ export class Runner {
     timeoutMs: number,
     stdinInput?: string
   ): Promise<ExecResult> {
+    const containerId = container.id.substring(0, 12);
+    let stream: PassThrough;
     try {
       const exec = await container.exec({
         Cmd: cmd,
@@ -242,27 +277,34 @@ export class Runner {
         setTimeout(() => reject(new Error("TimeoutError: Execution took too long")), timeoutMs)
       );
 
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
+      const streamPromise = new Promise<void>((resolve, reject) => {
           stream.on("end", resolve);
           stream.on("error", reject);
-        }),
-        timeout,
-      ]);
+      });
+
+      await Promise.race([ streamPromise, timeout ]);
 
       const inspect = await exec.inspect();
       if (inspect.ExitCode !== 0) {
-        return { success: false, stderr: stderr || stdout };
+        return { success: false, stderr: stderr || stdout, stdout: stdout || undefined };
       }
 
-      stream.on("end", () => {
-        stream.destroy();
-      });
-
-      return stderr
-        ? { success: false, stderr }
-        : { success: true, stdout };
+      return { success: true, stdout, stderr: stderr || undefined };
     } catch (err) {
+
+      if ((err as Error).message.startsWith("TimeoutError")) {
+          logger.warn(`Exec timed out for container ${containerId}. Stopping container...`);
+          try {
+              // force stop immediately
+              await container.stop({ t: 0 }); 
+          } catch (stopErr) {
+              logger.error(` Failed to stop container ${containerId}: ${(stopErr as Error).message}`);
+              // Container might be already stopped or gone
+          }
+          // Re-throw the timeout error so runCode can handle replacing it
+          throw err;
+      }
+
       return { success: false, error: (err as Error).message };
     }
   }
@@ -273,9 +315,10 @@ export class Runner {
       customCode : boolean = false,
       timeoutMs = config.EXECUTION_TIMEOUT,
     ): Promise<ExecResult> {
-      console.log(`[RUNNER] 1. Attempting to acquire a container for language: ${language}.`);
+      logger.info(`[RUNNER] 1. Attempting to acquire a container for language: ${language}.`);
       const container = await this.pool.acquire();
-      console.log(`[RUNNER] 2. Container acquired: ${container.id.substring(0, 12)}.`);
+      const containerId = container.id.substring(0, 12);
+      logger.info(`[RUNNER] 2. Container acquired: ${containerId}.`);
       
       // Define our standard paths within the sandbox
       const codeDir = '/sandbox/code';
@@ -283,97 +326,128 @@ export class Runner {
       const resultsDir = '/sandbox/results';
       const resultsPath = `${resultsDir}/output.json`; // The file we will read
 
+      let releaseContainer = true; // Flag to control container release
+      let execResult: ExecResult;
+
       try {
-        let execResult: ExecResult;
+        try {
+          if (language === "javascript") {
+            const filename = `${codeDir}/code.js`;
+            logger.info(`[RUNNER] 3a. Writing JavaScript code to ${filename}.`);
+            await this.writeFile(container, filename, code);
+            logger.info(`[RUNNER] 4a. Executing command: node ${filename}.`);
+            execResult = await this.execInContainer(container, ["node", filename], timeoutMs);
+          } else if (language === "python") {
+            const filename = `${codeDir}/code.py`;
+            logger.info(`[RUNNER] 3b. Writing Python code to ${filename}.`);
+            await this.writeFile(container, filename, code);
+            logger.info(`[RUNNER] 4b. Executing command: python3 ${filename}.`);
+            execResult = await this.execInContainer(container, ["python3", filename], timeoutMs);
+          } else if (language === "go") {
+            const sourcePath = `${codeDir}/main.go`;
+            const outputPath = `${binDir}/executable`;
+            logger.info(`[RUNNER] 3c. Writing Go code to ${sourcePath}.`);
+            await this.writeFile(container, sourcePath, code);
 
-        if (language === "javascript") {
-          const filename = `${codeDir}/code.js`;
-          console.log(`[RUNNER] 3a. Writing JavaScript code to ${filename}.`);
-          await this.writeFile(container, filename, code);
-          console.log(`[RUNNER] 4a. Executing command: node ${filename}.`);
-          // NOTE: The Node execution will run as 'appuser'
-          execResult = await this.execInContainer(container, ["node", filename], timeoutMs);
-        } else if (language === "python") {
-          const filename = `${codeDir}/code.py`;
-          console.log(`[RUNNER] 3b. Writing Python code to ${filename}.`);
-          await this.writeFile(container, filename, code);
-          console.log(`[RUNNER] 4b. Executing command: python3 ${filename}.`);
-          // NOTE: The Python execution will run as 'appuser'
-          execResult = await this.execInContainer(container, ["python3", filename], timeoutMs);
-        } else if (language === "go") {
-          const sourcePath = `${codeDir}/main.go`;
-          const outputPath = `${binDir}/executable`;
-          console.log(`[RUNNER] 3c. Writing Go code to ${sourcePath}.`);
-          await this.writeFile(container, sourcePath, code);
+            logger.info(`[RUNNER] 4c. Compiling Go code: go build -o ${outputPath} ${sourcePath}.`);
+            const compileResult = await this.execInContainer(container, ["go", "build", "-o", outputPath, sourcePath], timeoutMs);
+            
+            if (!compileResult.success) {
+              logger.info("[RUNNER] 5c. Go compilation failed. Returning error.");
+              return compileResult; // Return early, container is fine
+            }
+            logger.info("[RUNNER] 5c. Go compilation successful.");
 
-          console.log(`[RUNNER] 4c. Compiling Go code: go build -o ${outputPath} ${sourcePath}.`);
-          // NOTE: Go compilation command runs as 'appuser'
-          const compileResult = await this.execInContainer(container, ["go", "build", "-o", outputPath, sourcePath], timeoutMs);
-          
-          if (!compileResult.success) {
-            console.log("[RUNNER] 5c. Go compilation failed. Returning error.");
-            return compileResult;
+            logger.info(`[RUNNER] 6c. Executing compiled Go binary: ${outputPath}.`);
+            execResult = await this.execInContainer(container, [outputPath], timeoutMs);
+          } else {
+            logger.warn(`[RUNNER] 3d. Unsupported language: ${language}.`);
+            return { success: false, error: `Unsupported language: ${language}` }; // Return early
           }
-          console.log("[RUNNER] 5c. Go compilation successful.");
-
-          console.log(`[RUNNER] 6c. Executing compiled Go binary: ${outputPath}.`);
-          // NOTE: Execution of the binary runs as 'appuser'
-          execResult = await this.execInContainer(container, [outputPath], timeoutMs);
-        } else {
-          console.warn(`[RUNNER] 3d. Unsupported language: ${language}.`);
-          return { success: false, error: `Unsupported language: ${language}` };
+        } catch (err) {
+            // --- Catch block for timeout ---
+            logger.error(`[RUNNER] Execution error for container ${containerId}.`);
+            if ((err as Error).message.startsWith("TimeoutError")) {
+                logger.warn(`[RUNNER] Execution TIMED OUT. Replacing container ${containerId}.`);
+                releaseContainer = false; // Don't release, will replace it
+                try {
+                    await this.pool.replace(container); // Call new replace method
+                } catch (replaceErr) {
+                    logger.error(`[RUNNER] Failed to replace bad container ${containerId}: ${(replaceErr as Error).message}`);
+                }
+            }
+            return { success: false, error: (err as Error).message, stderr: (err as Error).message };
         }
 
-        console.log(`[RUNNER] 7. Code execution result: success=${execResult.success}.`);
+        logger.info(`[RUNNER] 7. Code execution result: success=${execResult.success}.`);
 
         // If code execution was successful, try to read the judge output file
         if (execResult.success && !customCode) {
-            console.log(`[RUNNER] 8. Attempting to read judge output file: ${resultsPath}.`);
+            logger.info(`[RUNNER] 8. Attempting to read judge output file: ${resultsPath}.`);
             try {
                 const archiveStream = await container.getArchive({ path: resultsPath });
                 const fileContent = await this.extractFileFromStream(archiveStream);
                 execResult.judgeOutput = fileContent;
-                console.log("[RUNNER] 9. Judge output successfully read.");
+                logger.info("[RUNNER] 9. Judge output successfully read.");
             } catch (readError) {
                 // File might not exist if the code crashed before writing it
                 const errorMessage = `Failed to read results file: ${(readError as Error).message}`;
-                execResult.stderr = errorMessage;
+                execResult.stderr = (execResult.stderr ?? "") + "\n" + errorMessage;
                 execResult.success = false;
-                console.error(`[RUNNER] 9. Error reading judge output: ${errorMessage}`);
+                logger.error(`[RUNNER] 9. Error reading judge output: ${errorMessage}`);
             }
         } else if(customCode){
-            console.log("[RUNNER] 8. Custom code execution success");
+            logger.info("[RUNNER] 8. Custom code execution success");
         }else{
-            console.log("[RUNNER] 8. Execution failed (stderr/timeout). Skipping judge output read.");
+            logger.info("[RUNNER] 8. Execution failed (stderr/timeout). Skipping judge output read.");
         }
         
         return execResult;
 
       } finally {
-        console.log("[RUNNER] 10. Starting cleanup.");
+        logger.info(`[RUNNER] 10. Starting cleanup for ${containerId}.`);
         
-        const cleanupExec = await container.exec({
-            Cmd: ["/bin/sh", "-c", `rm -rf ${codeDir}/* ${resultsDir}/* ${binDir}/*`],
-            User: "root" 
-        });
+        if(releaseContainer) {
+            try {
+                const cleanupExec = await container.exec({
+                    Cmd: ["/bin/sh", "-c", `rm -rf ${codeDir}/* ${resultsDir}/* ${binDir}/*`],
+                    User: "root" 
+                });
 
-        // Get the stream from the cleanup command
-        const stream = await cleanupExec.start({ hijack: true, stdin: false });
-        
-        // Wait for the stream to end. This ensures the command has finished executing.
-        await new Promise<void>((resolve, reject) => {
-            stream.on('end', resolve);
-            stream.on('error', reject);
-        });
+                const stream = await cleanupExec.start({ hijack: true, stdin: false });
+                
+                await new Promise<void>((resolve, reject) => {
+                    const cleanupTimer = setTimeout(() => reject(new Error("Cleanup timeout")), 2000); // 2s cleanup timeout
+                    stream.on('end', () => {
+                        clearTimeout(cleanupTimer);
+                        resolve();
+                    });
+                    stream.on('error', (err) => {
+                        clearTimeout(cleanupTimer);
+                        reject(err);
+                    });
+                });
 
-        // Optional but recommended: Check the exit code to be certain cleanup succeeded
-        const inspectResult = await cleanupExec.inspect();
-        if (inspectResult.ExitCode !== 0) {
-            console.error(`[RUNNER] Cleanup failed with exit code: ${inspectResult.ExitCode}`);
+                const inspectResult = await cleanupExec.inspect();
+                if (inspectResult.ExitCode !== 0) {
+                    logger.error(`[RUNNER] Cleanup failed for ${containerId} with exit code: ${inspectResult.ExitCode}`);
+                }
+                logger.info(`[RUNNER] 11. Cleanup complete for ${containerId}. Releasing container.`);
+                this.pool.release(container);
+
+            } catch (cleanupErr) {
+                logger.warn(`[RUNNER] Cleanup exec failed for ${containerId} (container might be dead): ${(cleanupErr as Error).message}`);
+                try {
+                    await this.pool.replace(container);
+                } catch (replaceErr) {
+                    logger.error(`[RUNNER] Failed to replace container ${containerId} after cleanup fail: ${(replaceErr as Error).message}`);
+                }
+            }
+        } else {
+            // This block runs if releaseContainer is false (i.e., on timeout)
+            // The container was already stopped and replaced in the catch block.
+            logger.info(`[RUNNER] 11. Container ${containerId} was not released (handled by error block).`);
         }
-        console.log("[RUNNER] 11. Cleanup complete. Releasing container.");
-        this.pool.release(container);
-
       }
     }
 
