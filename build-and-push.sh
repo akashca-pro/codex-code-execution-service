@@ -3,7 +3,7 @@
 # --- 1. Argument Check ---
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
   echo "❌ Error: You must provide BOTH an image name, dockerfile path and a version tag."
-  echo "Usage: $0 <file-name> <image-name> <version>"
+  echo "Usage: $0 <image-name> <version> <file-name>"
   exit 1
 fi
 
@@ -22,7 +22,7 @@ echo "==========================================="
 
 # --- 3. Build the Docker Image ---
 echo "⚙️  Building Docker image: $FULL_TAG"
-docker build --no-cache -f $FILE_NAME -t "$FULL_TAG" .
+docker build -f $FILE_NAME -t "$FULL_TAG" .
 
 # Check if the build was successful
 if [ $? -ne 0 ]; then
